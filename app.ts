@@ -3,6 +3,7 @@ import {
   App,
   BlockAction,
   ButtonAction,
+  OverflowAction,
   AllMiddlewareArgs,
   SlackActionMiddlewareArgs,
 } from '@slack/bolt';
@@ -149,6 +150,16 @@ function queueBlocks(
           type: 'button',
           text: { type: 'plain_text', text: 'Refresh' },
           action_id: 'queue_refresh',
+        },
+        {
+          type: 'overflow',
+          action_id: 'queue_more',
+          options: [
+            {
+              text: { type: 'plain_text', text: 'Delete message' },
+              value: 'delete',
+            },
+          ],
         },
       ],
     }
@@ -375,6 +386,39 @@ handleAction('queue_join', async ({ ack, body, client }) => {
     ts: body.message?.ts,
   });
 });
+
+app.action<BlockAction<OverflowAction>>(
+  'queue_more',
+  async ({ ack, action, body, client, respond }) => {
+    await ack();
+    const selected = action.selected_option?.value;
+    if (selected !== 'delete') return;
+
+    const channelId = body.channel?.id;
+    const teamId = body.team?.id;
+    const ts = body.message?.ts;
+    if (!channelId || !ts) return;
+
+    try {
+      await client.chat.delete({ channel: channelId, ts });
+      if (teamId) await redis.del(lastMessageKeyFor(teamId, channelId));
+      if (respond) {
+        await respond({
+          response_type: 'ephemeral',
+          text: 'Queue message deleted.',
+        });
+      }
+    } catch (err) {
+      console.error('[queue] chat.delete failed:', err);
+      if (respond) {
+        await respond({
+          response_type: 'ephemeral',
+          text: 'Sorry, I could not delete that message.',
+        });
+      }
+    }
+  }
+);
 
 handleAction('queue_leave', async ({ ack, body, client }) => {
   await ack();

@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   redis:
     image: redis:7-alpine
@@ -13,7 +12,11 @@ services:
     restart: unless-stopped
 
   deploy-queue:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_REV: ${BUILD_REV:-0}
     environment:
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
@@ -21,9 +24,8 @@ services:
       REDIS_URL: redis://redis:6379
       NODE_ENV: production
       PORT: 3000
-      # NOTIFY_DM: "true"   # optional
+      # NOTIFY_DM: "true"
     depends_on:
       redis:
         condition: service_healthy
-    # Socket Mode => no inbound ports exposed
     restart: unless-stopped
