@@ -128,7 +128,7 @@ function queueBlocks(
       elements: [
         {
           type: 'mrkdwn',
-          text: 'View queue with `/deploy-queue` and join with `/deploy-queue join`',
+          text: 'View queue with `/deploy-queue` and join with `/deploy-queue join`.',
         },
       ],
     },
