@@ -171,7 +171,7 @@ async function postOrUpdateQueueView({
   channel,
   teamId,
   title = 'Channel Queue',
-  ts,
+  ts: _ts, // deprecated; kept for backwards compatibility
   queueNote,
 }: {
   client: any;
@@ -184,29 +184,28 @@ async function postOrUpdateQueueView({
   const users = await listQueue(teamId, channel);
   const blocks = queueBlocks(title, users, { queueNote });
   const lastMessageKey = lastMessageKeyFor(teamId, channel);
-  const knownTs = ts ?? (await redis.get(lastMessageKey));
+  const result = await client.chat.postMessage({
+    channel,
+    blocks,
+    text: 'Queue',
+  });
+  const newTs: string | undefined = result?.ts;
 
-  if (knownTs) {
+  if (!newTs) {
+    await redis.del(lastMessageKey);
+    return result;
+  }
+
+  const previousTs = await redis.getset(lastMessageKey, newTs);
+  if (previousTs && previousTs !== newTs) {
     try {
-      await client.chat.delete({ channel, ts: knownTs });
+      await client.chat.delete({ channel, ts: previousTs });
     } catch (err: any) {
       const slackError = err?.data?.error;
       if (slackError !== 'message_not_found' && slackError !== 'cant_delete_message') {
         console.error('[queue] failed to delete previous queue message:', err);
       }
     }
-  }
-
-  const result = await client.chat.postMessage({
-    channel,
-    blocks,
-    text: 'Queue',
-  });
-
-  if (result?.ts) {
-    await redis.set(lastMessageKey, result.ts);
-  } else {
-    await redis.del(lastMessageKey);
   }
 
   return result;
