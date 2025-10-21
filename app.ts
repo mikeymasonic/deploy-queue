@@ -5,10 +5,10 @@ import {
   ButtonAction,
   AllMiddlewareArgs,
   SlackActionMiddlewareArgs,
-  SlackCommandMiddlewareArgs,
 } from '@slack/bolt';
 import Redis from 'ioredis';
 
+/* ------------ Env + sanity ------------ */
 const {
   SLACK_BOT_TOKEN,
   SLACK_SIGNING_SECRET,
@@ -17,13 +17,21 @@ const {
   PORT = '3000',
 } = process.env as Record<string, string>;
 
-// const redis = new Redis(REDIS_URL);
-const redis = new Redis(process.env.REDIS_URL!);
+if (!SLACK_SIGNING_SECRET || !SLACK_BOT_TOKEN || !SLACK_APP_LEVEL_TOKEN) {
+  console.error(
+    'Missing env vars. Needed: SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, SLACK_APP_LEVEL_TOKEN'
+  );
+  process.exit(1);
+}
+const NODE_ENV = process.env.NODE_ENV ?? 'development';
+
+/* ------------ Redis ------------ */
+const redis = new Redis(REDIS_URL || 'redis://127.0.0.1:6379');
 redis.on('error', (err) => {
   console.error('[redis] error:', err?.message || err);
 });
-const NODE_ENV = process.env.NODE_ENV ?? 'development';
 
+/* ------------ Bolt App (Socket Mode) ------------ */
 const app = new App({
   token: SLACK_BOT_TOKEN,
   signingSecret: SLACK_SIGNING_SECRET,
@@ -32,25 +40,13 @@ const app = new App({
   port: Number(PORT),
 });
 
-if (
-  !process.env.SLACK_SIGNING_SECRET ||
-  !process.env.SLACK_BOT_TOKEN ||
-  !process.env.SLACK_APP_LEVEL_TOKEN
-) {
-  console.error(
-    'Missing env vars. Needed: SLACK_SIGNING_SECRET, SLACK_BOT_TOKEN, SLACK_APP_LEVEL_TOKEN'
-  );
-  process.exit(1);
-}
-
-// ---------- Helpers ----------
+/* ------------ Helpers: storage & formatting ------------ */
 const keyFor = (teamId: string, channelId: string) =>
   `queue:${teamId}:${channelId}`;
 
 async function joinQueue(teamId: string, channelId: string, userId: string) {
   const key = keyFor(teamId, channelId);
   const now = Date.now();
-  // NX avoids duplicates; returns 1 if added, 0 if already present
   const added = await redis.zadd(key, 'NX', now, userId);
   return added === 1;
 }
@@ -63,21 +59,17 @@ async function leaveQueue(teamId: string, channelId: string, userId: string) {
 
 async function listQueue(teamId: string, channelId: string) {
   const key = keyFor(teamId, channelId);
-  return redis.zrange(key, 0, -1); // [userId...]
+  return redis.zrange(key, 0, -1);
 }
 
 async function popNext(teamId: string, channelId: string) {
   const key = keyFor(teamId, channelId);
-  // Use a transaction to get and remove atomically
   while (true) {
-    const multi = redis.multi();
-    multi.zrange(key, 0, 0);
-    const results = await multi.exec();
-    const first = (results?.[0]?.[1] as string[] | undefined)?.[0];
+    const first = (await redis.zrange(key, 0, 0))[0];
     if (!first) return null;
     const removed = await redis.zrem(key, first);
     if (removed === 1) return first;
-    // else retry in rare race
+    // rare race: loop and try again
   }
 }
 
@@ -136,7 +128,56 @@ async function postOrUpdateQueueView({
   return client.chat.postMessage({ channel, blocks, text: 'Queue' });
 }
 
-// ---------- Slash command: /queue ----------
+/* ------------ Notify when first-in-line changes ------------ */
+async function firstUser(teamId: string, channelId: string) {
+  const key = keyFor(teamId, channelId);
+  const users = await redis.zrange(key, 0, 0);
+  return users[0] ?? null;
+}
+
+async function notifyNowFirst({
+  client,
+  channelId,
+  userId,
+  alsoDM = process.env.NOTIFY_DM === 'true',
+}: {
+  client: any;
+  channelId: string;
+  userId: string;
+  alsoDM?: boolean;
+}) {
+  // Channel mention
+  await client.chat.postMessage({
+    channel: channelId,
+    text: `<@${userId}> you're now first in the deploy queue!`,
+  });
+
+  // Optional DM
+  if (alsoDM) {
+    const im = await client.conversations.open({ users: userId });
+    await client.chat.postMessage({
+      channel: im.channel.id,
+      text: `Heads up — you're now first in the *deploy queue* for <#${channelId}>.`,
+    });
+  }
+}
+
+/** Wrap a mutating op; if #1 changed, notify the new #1 */
+async function withFirstChangeNotify(
+  client: any,
+  teamId: string,
+  channelId: string,
+  op: () => Promise<void>
+) {
+  const before = await firstUser(teamId, channelId);
+  await op();
+  const after = await firstUser(teamId, channelId);
+  if (after && after !== before) {
+    await notifyNowFirst({ client, channelId, userId: after });
+  }
+}
+
+/* ------------ Slash command: /deploy-queue ------------ */
 app.command(
   '/deploy-queue',
   async ({ ack, command, client, respond, body }) => {
@@ -145,36 +186,44 @@ app.command(
     const channelId = command.channel_id;
     const userId = command.user_id;
 
-    const [sub, ...rest] = (command.text || '').trim().split(/\s+/);
+    const [sub] = (command.text || '').trim().split(/\s+/);
     const action = (sub || 'show').toLowerCase();
 
     switch (action) {
       case 'join': {
-        const added = await joinQueue(teamId, channelId, userId);
-        await respond({
-          response_type: 'ephemeral',
-          text: added
-            ? 'You joined the queue.'
-            : 'You are already in the queue.',
+        await withFirstChangeNotify(client, teamId, channelId, async () => {
+          const added = await joinQueue(teamId, channelId, userId);
+          await respond({
+            response_type: 'ephemeral',
+            text: added
+              ? 'You joined the queue.'
+              : 'You are already in the queue.',
+          });
         });
         await postOrUpdateQueueView({ client, channel: channelId, teamId });
         break;
       }
       case 'leave': {
-        const removed = await leaveQueue(teamId, channelId, userId);
-        await respond({
-          response_type: 'ephemeral',
-          text: removed ? 'You left the queue.' : 'You were not in the queue.',
+        await withFirstChangeNotify(client, teamId, channelId, async () => {
+          const removed = await leaveQueue(teamId, channelId, userId);
+          await respond({
+            response_type: 'ephemeral',
+            text: removed
+              ? 'You left the queue.'
+              : 'You were not in the queue.',
+          });
         });
         await postOrUpdateQueueView({ client, channel: channelId, teamId });
         break;
       }
       case 'next': {
-        // Optional: restrict to channel admins or specific roles
-        const nextUser = await popNext(teamId, channelId);
-        await client.chat.postMessage({
-          channel: channelId,
-          text: nextUser ? `Next up: <@${nextUser}>` : 'Queue is empty.',
+        // Announce who is up now (the person popped)
+        await withFirstChangeNotify(client, teamId, channelId, async () => {
+          const nextUser = await popNext(teamId, channelId);
+          await client.chat.postMessage({
+            channel: channelId,
+            text: nextUser ? `Next up: <@${nextUser}>` : 'Queue is empty.',
+          });
         });
         await postOrUpdateQueueView({ client, channel: channelId, teamId });
         break;
@@ -188,7 +237,7 @@ app.command(
   }
 );
 
-// ---------- Button actions ----------
+/* ------------ Button actions ------------ */
 async function handleAction(
   actionId: 'queue_join' | 'queue_leave' | 'queue_refresh',
   handler: (
@@ -201,10 +250,14 @@ async function handleAction(
 
 handleAction('queue_join', async ({ ack, body, client }) => {
   await ack();
-  const teamId = body.team?.id!;
-  const channelId = body.channel?.id!;
+  const teamId = body.team!.id!;
+  const channelId = body.channel!.id!;
   const userId = body.user.id;
-  await joinQueue(teamId, channelId, userId);
+
+  await withFirstChangeNotify(client, teamId, channelId, async () => {
+    await joinQueue(teamId, channelId, userId);
+  });
+
   await postOrUpdateQueueView({
     client,
     channel: channelId,
@@ -215,10 +268,14 @@ handleAction('queue_join', async ({ ack, body, client }) => {
 
 handleAction('queue_leave', async ({ ack, body, client }) => {
   await ack();
-  const teamId = body.team?.id!;
-  const channelId = body.channel?.id!;
+  const teamId = body.team!.id!;
+  const channelId = body.channel!.id!;
   const userId = body.user.id;
-  await leaveQueue(teamId, channelId, userId);
+
+  await withFirstChangeNotify(client, teamId, channelId, async () => {
+    await leaveQueue(teamId, channelId, userId);
+  });
+
   await postOrUpdateQueueView({
     client,
     channel: channelId,
@@ -229,8 +286,8 @@ handleAction('queue_leave', async ({ ack, body, client }) => {
 
 handleAction('queue_refresh', async ({ ack, body, client }) => {
   await ack();
-  const teamId = body.team?.id!;
-  const channelId = body.channel?.id!;
+  const teamId = body.team!.id!;
+  const channelId = body.channel!.id!;
   await postOrUpdateQueueView({
     client,
     channel: channelId,
@@ -239,7 +296,12 @@ handleAction('queue_refresh', async ({ ack, body, client }) => {
   });
 });
 
-// ---------- Start ----------
+/* ------------ Global error logger (handy) ------------ */
+app.error(async (err) => {
+  console.error('[bolt] app.error:', err);
+});
+
+/* ------------ Start ------------ */
 (async () => {
   await app.start();
   if (NODE_ENV !== 'test') console.log(`⚡️ Queue app running on ${PORT}`);
