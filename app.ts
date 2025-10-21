@@ -33,11 +33,10 @@ if (rawQueueMaxAgeHours !== undefined) {
     QUEUE_MAX_AGE_MS = parsed > 0 ? parsed * 60 * 60 * 1000 : null;
   }
 }
-
 if (rawQueueRepostThreshold !== undefined) {
   const parsed = Number(rawQueueRepostThreshold);
   if (Number.isFinite(parsed)) {
-    if (parsed < 0) QUEUE_REPOST_THRESHOLD = null;
+    if (parsed < 0) QUEUE_REPOST_THRESHOLD = null; // disable if < 0
     else QUEUE_REPOST_THRESHOLD = Math.floor(parsed);
   }
 }
@@ -141,7 +140,7 @@ function queueBlocks(
       elements: [
         {
           type: 'mrkdwn',
-          text: 'View queue with `/deploy-queue` and join with `/deploy-queue join`.',
+          text: 'View queue with `/deploy-queue` and join with `/deploy-queue join`',
         },
       ],
     },
@@ -195,26 +194,47 @@ async function queueMessageNeedsRepost({
   channel: string;
   ts: string;
   threshold: number;
-}) {
+}): Promise<boolean> {
   try {
-    const history = await client.conversations.history({
+    const res = await client.conversations.history({
       channel,
       oldest: ts,
-      inclusive: false,
-      limit: threshold + 1,
+      inclusive: false, // exclude the queue message itself
+      limit: Math.max(1, Math.min(100, threshold + 1)),
     });
-    const messages = history?.messages ?? [];
-    const visibleMessages = messages.filter(
-      (msg: any) => msg?.type === 'message' && msg.subtype !== 'tombstone'
+
+    if (!res || (res as any).ok !== true) {
+      console.error('[queue] history: unexpected response', res);
+      return false;
+    }
+
+    const messages = Array.isArray((res as any).messages)
+      ? (res as any).messages
+      : [];
+    const visible = messages.filter(
+      (m: any) => m?.type === 'message' && m?.subtype !== 'tombstone'
     );
-    return visibleMessages.length > threshold;
-  } catch (err) {
-    console.error('[queue] conversations.history failed:', err);
+
+    return visible.length > threshold;
+  } catch (err: any) {
+    const code = err?.data?.error || err?.code || err?.message || String(err);
+    if (
+      code === 'missing_scope' ||
+      code === 'not_in_channel' ||
+      code === 'not_in_conversation'
+    ) {
+      console.error(
+        '[queue] conversations.history failed:',
+        code,
+        '→ For public channels add channels:history; for private add groups:history; also ensure the bot is invited.'
+      );
+    } else {
+      console.error('[queue] conversations.history failed:', code);
+    }
     return false;
   }
 }
 
-/* ------------ Fixed message update logic ------------ */
 async function postOrUpdateQueueView({
   client,
   channel,
@@ -233,10 +253,12 @@ async function postOrUpdateQueueView({
   const users = await listQueue(teamId, channel);
   const blocks = queueBlocks(title, users, { queueNote });
   const lastMessageKey = lastMessageKeyFor(teamId, channel);
+
   let cachedTs = await redis.get(lastMessageKey);
   const effectiveTs = ts ?? cachedTs ?? undefined;
   let forceNewMessage = false;
 
+  // Decide whether to repost to bottom
   if (
     effectiveTs &&
     QUEUE_REPOST_THRESHOLD !== null &&
@@ -269,6 +291,7 @@ async function postOrUpdateQueueView({
     }
   }
 
+  // Try to update the clicked message in-place first
   if (!forceNewMessage && ts) {
     try {
       await client.chat.update({ channel, ts, blocks, text: 'Queue updated' });
@@ -281,11 +304,8 @@ async function postOrUpdateQueueView({
     }
   }
 
-  if (
-    !forceNewMessage &&
-    cachedTs &&
-    (ts === undefined || cachedTs !== ts)
-  ) {
+  // If we have a cached message, try updating it
+  if (!forceNewMessage && cachedTs && (ts === undefined || cachedTs !== ts)) {
     try {
       await client.chat.update({
         channel,
@@ -302,12 +322,13 @@ async function postOrUpdateQueueView({
     }
   }
 
+  // Fall back to new message (bottom of channel)
   const result = await client.chat.postMessage({
     channel,
     blocks,
     text: 'Queue',
   });
-  const newTs: string | undefined = result?.ts;
+  const newTs: string | undefined = (result as any)?.ts;
   if (newTs) await redis.set(lastMessageKey, newTs);
   else await redis.del(lastMessageKey);
   return result;
@@ -340,7 +361,7 @@ async function notifyNowFirst({
   if (alsoDM) {
     const im = await client.conversations.open({ users: userId });
     await client.chat.postMessage({
-      channel: im.channel.id,
+      channel: (im as any).channel.id,
       text: `Heads up — you're now first in the *deploy queue* for <#${channelId}>.`,
     });
   }
