@@ -1,0 +1,29 @@
+version: '3.8'
+services:
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - ./redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  deploy-queue:
+    build: .
+    environment:
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
+      SLACK_APP_LEVEL_TOKEN: ${SLACK_APP_LEVEL_TOKEN}
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      PORT: 3000
+      # NOTIFY_DM: "true"   # optional
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Socket Mode => no inbound ports exposed
+    restart: unless-stopped

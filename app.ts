@@ -16,6 +16,17 @@ const {
   REDIS_URL,
   PORT = '3000',
 } = process.env as Record<string, string>;
+const QUEUE_MAX_AGE_HOURS_DEFAULT = 12;
+const rawQueueMaxAgeHours = process.env.QUEUE_MAX_AGE_HOURS;
+let QUEUE_MAX_AGE_MS: number | null =
+  QUEUE_MAX_AGE_HOURS_DEFAULT * 60 * 60 * 1000;
+if (rawQueueMaxAgeHours !== undefined) {
+  const parsed = Number(rawQueueMaxAgeHours);
+  if (Number.isFinite(parsed)) {
+    QUEUE_MAX_AGE_MS =
+      parsed > 0 ? parsed * 60 * 60 * 1000 : null; // <=0 disables pruning
+  }
+}
 
 if (!SLACK_SIGNING_SECRET || !SLACK_BOT_TOKEN || !SLACK_APP_LEVEL_TOKEN) {
   console.error(
@@ -44,7 +55,16 @@ const app = new App({
 const keyFor = (teamId: string, channelId: string) =>
   `queue:${teamId}:${channelId}`;
 
+async function pruneStaleQueueEntries(teamId: string, channelId: string) {
+  if (!QUEUE_MAX_AGE_MS) return;
+  const cutoff = Date.now() - QUEUE_MAX_AGE_MS;
+  if (cutoff <= 0) return;
+  const key = keyFor(teamId, channelId);
+  await redis.zremrangebyscore(key, 0, cutoff);
+}
+
 async function joinQueue(teamId: string, channelId: string, userId: string) {
+  await pruneStaleQueueEntries(teamId, channelId);
   const key = keyFor(teamId, channelId);
   const now = Date.now();
   const added = await redis.zadd(key, 'NX', now, userId);
@@ -52,17 +72,20 @@ async function joinQueue(teamId: string, channelId: string, userId: string) {
 }
 
 async function leaveQueue(teamId: string, channelId: string, userId: string) {
+  await pruneStaleQueueEntries(teamId, channelId);
   const key = keyFor(teamId, channelId);
   const removed = await redis.zrem(key, userId);
   return removed === 1;
 }
 
 async function listQueue(teamId: string, channelId: string) {
+  await pruneStaleQueueEntries(teamId, channelId);
   const key = keyFor(teamId, channelId);
   return redis.zrange(key, 0, -1);
 }
 
 async function popNext(teamId: string, channelId: string) {
+  await pruneStaleQueueEntries(teamId, channelId);
   const key = keyFor(teamId, channelId);
   while (true) {
     const first = (await redis.zrange(key, 0, 0))[0];
@@ -73,14 +96,39 @@ async function popNext(teamId: string, channelId: string) {
   }
 }
 
-function queueBlocks(title: string, users: string[]) {
+function queueBlocks(
+  title: string,
+  users: string[],
+  opts?: { queueNote?: string }
+) {
   const textLines = users.length
     ? users.map((u, i) => `${i + 1}. <@${u}>`).join('\n')
     : '_No one is in the queue yet._';
 
-  return [
+  const blocks: any[] = [
     { type: 'section', text: { type: 'mrkdwn', text: `*${title}*` } },
     { type: 'section', text: { type: 'mrkdwn', text: textLines } },
+  ];
+
+  if (opts?.queueNote) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: opts.queueNote },
+    });
+  }
+
+  blocks.push(
+    { type: 'divider' },
+    {
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text:
+            'View queue with `/queue-deploy` and join with `/queue-deploy join`',
+        },
+      ],
+    },
     {
       type: 'actions',
       elements: [
@@ -103,8 +151,17 @@ function queueBlocks(title: string, users: string[]) {
           value: 'refresh',
         },
       ],
-    },
-  ];
+    }
+  );
+
+  return blocks;
+}
+
+function leaveQueueNote(leaverId: string, nextUserId: string | null) {
+  if (!nextUserId) {
+    return `<@${leaverId}> has left the queue.`;
+  }
+  return `<@${leaverId}> has left the queue.\n<@${nextUserId}> it is now your turn!`;
 }
 
 async function postOrUpdateQueueView({
@@ -113,15 +170,17 @@ async function postOrUpdateQueueView({
   teamId,
   title = 'Channel Queue',
   ts,
+  queueNote,
 }: {
   client: any;
   channel: string;
   teamId: string;
   title?: string;
   ts?: string;
+  queueNote?: string;
 }) {
   const users = await listQueue(teamId, channel);
-  const blocks = queueBlocks(title, users);
+  const blocks = queueBlocks(title, users, { queueNote });
   if (ts) {
     return client.chat.update({ channel, ts, blocks, text: 'Queue updated' });
   }
@@ -130,6 +189,7 @@ async function postOrUpdateQueueView({
 
 /* ------------ Notify when first-in-line changes ------------ */
 async function firstUser(teamId: string, channelId: string) {
+  await pruneStaleQueueEntries(teamId, channelId);
   const key = keyFor(teamId, channelId);
   const users = await redis.zrange(key, 0, 0);
   return users[0] ?? null;
@@ -217,16 +277,29 @@ app.command(
       }
 
       case 'leave': {
+        let removed = false;
+        let nextUserId: string | null = null;
         await withFirstChangeNotify(client, teamId, channelId, async () => {
-          const removed = await leaveQueue(teamId, channelId, userId);
+          removed = await leaveQueue(teamId, channelId, userId);
           await respond({
             response_type: 'ephemeral',
             text: removed
               ? 'You left the queue.'
               : 'You were not in the queue.',
           });
+          if (removed) {
+            nextUserId = await firstUser(teamId, channelId);
+          }
         });
-        await postOrUpdateQueueView({ client, channel: channelId, teamId });
+        const queueNote = removed
+          ? leaveQueueNote(userId, nextUserId)
+          : undefined;
+        await postOrUpdateQueueView({
+          client,
+          channel: channelId,
+          teamId,
+          queueNote,
+        });
         break;
       }
       case 'next': {
@@ -291,15 +364,25 @@ handleAction('queue_leave', async ({ ack, body, client }) => {
   const channelId = body.channel!.id!;
   const userId = body.user.id;
 
+  let removed = false;
+  let nextUserId: string | null = null;
   await withFirstChangeNotify(client, teamId, channelId, async () => {
-    await leaveQueue(teamId, channelId, userId);
+    removed = await leaveQueue(teamId, channelId, userId);
+    if (removed) {
+      nextUserId = await firstUser(teamId, channelId);
+    }
   });
+
+  const queueNote = removed
+    ? leaveQueueNote(userId, nextUserId)
+    : undefined;
 
   await postOrUpdateQueueView({
     client,
     channel: channelId,
     teamId,
     ts: body.message?.ts,
+    queueNote,
   });
 });
 
