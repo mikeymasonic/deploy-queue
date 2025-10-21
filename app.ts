@@ -23,10 +23,22 @@ const rawQueueMaxAgeHours = process.env.QUEUE_MAX_AGE_HOURS;
 let QUEUE_MAX_AGE_MS: number | null =
   QUEUE_MAX_AGE_HOURS_DEFAULT * 60 * 60 * 1000;
 
+const QUEUE_REPOST_THRESHOLD_DEFAULT = 5;
+const rawQueueRepostThreshold = process.env.QUEUE_REPOST_THRESHOLD;
+let QUEUE_REPOST_THRESHOLD: number | null = QUEUE_REPOST_THRESHOLD_DEFAULT;
+
 if (rawQueueMaxAgeHours !== undefined) {
   const parsed = Number(rawQueueMaxAgeHours);
   if (Number.isFinite(parsed)) {
     QUEUE_MAX_AGE_MS = parsed > 0 ? parsed * 60 * 60 * 1000 : null;
+  }
+}
+
+if (rawQueueRepostThreshold !== undefined) {
+  const parsed = Number(rawQueueRepostThreshold);
+  if (Number.isFinite(parsed)) {
+    if (parsed < 0) QUEUE_REPOST_THRESHOLD = null;
+    else QUEUE_REPOST_THRESHOLD = Math.floor(parsed);
   }
 }
 
@@ -129,7 +141,7 @@ function queueBlocks(
       elements: [
         {
           type: 'mrkdwn',
-          text: 'View queue with `/deploy-queue` and join with `/deploy-queue join`',
+          text: 'View queue with `/deploy-queue` and join with `/deploy-queue join`.',
         },
       ],
     },
@@ -173,6 +185,35 @@ function leaveQueueNote(leaverId: string, nextUserId: string | null) {
     : `<@${leaverId}> has left the queue.`;
 }
 
+async function queueMessageNeedsRepost({
+  client,
+  channel,
+  ts,
+  threshold,
+}: {
+  client: any;
+  channel: string;
+  ts: string;
+  threshold: number;
+}) {
+  try {
+    const history = await client.conversations.history({
+      channel,
+      oldest: ts,
+      inclusive: false,
+      limit: threshold + 1,
+    });
+    const messages = history?.messages ?? [];
+    const visibleMessages = messages.filter(
+      (msg: any) => msg?.type === 'message' && msg.subtype !== 'tombstone'
+    );
+    return visibleMessages.length > threshold;
+  } catch (err) {
+    console.error('[queue] conversations.history failed:', err);
+    return false;
+  }
+}
+
 /* ------------ Fixed message update logic ------------ */
 async function postOrUpdateQueueView({
   client,
@@ -192,9 +233,43 @@ async function postOrUpdateQueueView({
   const users = await listQueue(teamId, channel);
   const blocks = queueBlocks(title, users, { queueNote });
   const lastMessageKey = lastMessageKeyFor(teamId, channel);
+  let cachedTs = await redis.get(lastMessageKey);
+  const effectiveTs = ts ?? cachedTs ?? undefined;
+  let forceNewMessage = false;
 
-  // (1) Try in-place update (button clicks)
-  if (ts) {
+  if (
+    effectiveTs &&
+    QUEUE_REPOST_THRESHOLD !== null &&
+    QUEUE_REPOST_THRESHOLD >= 0
+  ) {
+    const needsRepost = await queueMessageNeedsRepost({
+      client,
+      channel,
+      ts: effectiveTs,
+      threshold: QUEUE_REPOST_THRESHOLD,
+    });
+    if (needsRepost) {
+      let deleted = false;
+      try {
+        await client.chat.delete({ channel, ts: effectiveTs });
+        deleted = true;
+      } catch (err: any) {
+        const code = err?.data?.error;
+        if (code === 'message_not_found') {
+          deleted = true;
+        } else if (code !== 'cant_delete_message') {
+          console.error('[queue] chat.delete failed:', code || err);
+        }
+      }
+      if (deleted) {
+        await redis.del(lastMessageKey);
+        cachedTs = null;
+        forceNewMessage = true;
+      }
+    }
+  }
+
+  if (!forceNewMessage && ts) {
     try {
       await client.chat.update({ channel, ts, blocks, text: 'Queue updated' });
       await redis.set(lastMessageKey, ts);
@@ -206,25 +281,27 @@ async function postOrUpdateQueueView({
     }
   }
 
-  // (2) Try updating previous message
-  const prevTs = await redis.get(lastMessageKey);
-  if (prevTs) {
+  if (
+    !forceNewMessage &&
+    cachedTs &&
+    (ts === undefined || cachedTs !== ts)
+  ) {
     try {
       await client.chat.update({
         channel,
-        ts: prevTs,
+        ts: cachedTs,
         blocks,
         text: 'Queue updated',
       });
-      return { ts: prevTs };
+      await redis.set(lastMessageKey, cachedTs);
+      return { ts: cachedTs };
     } catch (err: any) {
       const code = err?.data?.error;
       if (code !== 'message_not_found' && code !== 'cant_update_message')
-        console.error('[queue] chat.update (prevTs) failed:', code || err);
+        console.error('[queue] chat.update (cachedTs) failed:', code || err);
     }
   }
 
-  // (3) Fall back to new message
   const result = await client.chat.postMessage({
     channel,
     blocks,

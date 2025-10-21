@@ -11,11 +11,22 @@ const { SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_APP_LEVEL_TOKEN, REDIS_URL,
 const QUEUE_MAX_AGE_HOURS_DEFAULT = 12;
 const rawQueueMaxAgeHours = process.env.QUEUE_MAX_AGE_HOURS;
 let QUEUE_MAX_AGE_MS = QUEUE_MAX_AGE_HOURS_DEFAULT * 60 * 60 * 1000;
+const QUEUE_REPOST_THRESHOLD_DEFAULT = 5;
+const rawQueueRepostThreshold = process.env.QUEUE_REPOST_THRESHOLD;
+let QUEUE_REPOST_THRESHOLD = QUEUE_REPOST_THRESHOLD_DEFAULT;
 if (rawQueueMaxAgeHours !== undefined) {
     const parsed = Number(rawQueueMaxAgeHours);
     if (Number.isFinite(parsed)) {
-        QUEUE_MAX_AGE_MS =
-            parsed > 0 ? parsed * 60 * 60 * 1000 : null; // <=0 disables pruning
+        QUEUE_MAX_AGE_MS = parsed > 0 ? parsed * 60 * 60 * 1000 : null;
+    }
+}
+if (rawQueueRepostThreshold !== undefined) {
+    const parsed = Number(rawQueueRepostThreshold);
+    if (Number.isFinite(parsed)) {
+        if (parsed < 0)
+            QUEUE_REPOST_THRESHOLD = null;
+        else
+            QUEUE_REPOST_THRESHOLD = Math.floor(parsed);
     }
 }
 if (!SLACK_SIGNING_SECRET || !SLACK_BOT_TOKEN || !SLACK_APP_LEVEL_TOKEN) {
@@ -25,10 +36,8 @@ if (!SLACK_SIGNING_SECRET || !SLACK_BOT_TOKEN || !SLACK_APP_LEVEL_TOKEN) {
 const NODE_ENV = process.env.NODE_ENV ?? 'development';
 /* ------------ Redis ------------ */
 const redis = new ioredis_1.default(REDIS_URL || 'redis://127.0.0.1:6379');
-redis.on('error', (err) => {
-    console.error('[redis] error:', err?.message || err);
-});
-/* ------------ Bolt App (Socket Mode) ------------ */
+redis.on('error', (err) => console.error('[redis] error:', err?.message || err));
+/* ------------ Bolt App ------------ */
 const app = new bolt_1.App({
     token: SLACK_BOT_TOKEN,
     signingSecret: SLACK_SIGNING_SECRET,
@@ -36,7 +45,7 @@ const app = new bolt_1.App({
     appToken: SLACK_APP_LEVEL_TOKEN,
     port: Number(PORT),
 });
-/* ------------ Helpers: storage & formatting ------------ */
+/* ------------ Helpers ------------ */
 const keyFor = (teamId, channelId) => `queue:${teamId}:${channelId}`;
 const lastMessageKeyFor = (teamId, channelId) => `queue:last-message:${teamId}:${channelId}`;
 async function pruneStaleQueueEntries(teamId, channelId) {
@@ -76,9 +85,9 @@ async function popNext(teamId, channelId) {
         const removed = await redis.zrem(key, first);
         if (removed === 1)
             return first;
-        // rare race: loop and try again
     }
 }
+/* ------------ Message blocks ------------ */
 function queueBlocks(title, users, opts) {
     const textLines = users.length
         ? users.map((u, i) => `${i + 1}. <@${u}>`).join('\n')
@@ -98,7 +107,7 @@ function queueBlocks(title, users, opts) {
         elements: [
             {
                 type: 'mrkdwn',
-                text: 'View queue with `/queue-deploy` and join with `/queue-deploy join`',
+                text: 'View queue with `/deploy-queue` and join with `/deploy-queue join`.',
             },
         ],
     }, {
@@ -108,75 +117,121 @@ function queueBlocks(title, users, opts) {
                 type: 'button',
                 text: { type: 'plain_text', text: 'Join' },
                 action_id: 'queue_join',
-                value: 'join',
             },
             {
                 type: 'button',
                 text: { type: 'plain_text', text: 'Leave' },
                 action_id: 'queue_leave',
-                value: 'leave',
             },
             {
                 type: 'button',
                 text: { type: 'plain_text', text: 'Refresh' },
                 action_id: 'queue_refresh',
-                value: 'refresh',
+            },
+            {
+                type: 'overflow',
+                action_id: 'queue_more',
+                options: [
+                    {
+                        text: { type: 'plain_text', text: 'Delete message' },
+                        value: 'delete',
+                    },
+                ],
             },
         ],
     });
     return blocks;
 }
 function leaveQueueNote(leaverId, nextUserId) {
-    if (!nextUserId) {
-        return `<@${leaverId}> has left the queue.`;
-    }
-    return `<@${leaverId}> has left the queue.\n<@${nextUserId}> it is now your turn!`;
+    return nextUserId
+        ? `<@${leaverId}> has left the queue.\n<@${nextUserId}> it is now your turn!`
+        : `<@${leaverId}> has left the queue.`;
 }
-async function clearQueueMessage(teamId, channel, client) {
-    const key = lastMessageKeyFor(teamId, channel);
-    const ts = await redis.get(key);
-    if (!ts)
-        return false;
+async function queueMessageNeedsRepost({ client, channel, ts, threshold, }) {
     try {
-        await client.chat.delete({ channel, ts });
+        const history = await client.conversations.history({
+            channel,
+            oldest: ts,
+            inclusive: false,
+            limit: threshold + 1,
+        });
+        const messages = history?.messages ?? [];
+        const visibleMessages = messages.filter((msg) => msg?.type === 'message' && msg.subtype !== 'tombstone');
+        return visibleMessages.length > threshold;
     }
     catch (err) {
-        const slackError = err?.data?.error;
-        if (slackError !== 'message_not_found' && slackError !== 'cant_delete_message') {
-            console.error('[queue] failed to delete queue message:', err);
-            throw err;
-        }
+        console.error('[queue] conversations.history failed:', err);
+        return false;
     }
-    await redis.del(key);
-    return true;
 }
+/* ------------ Fixed message update logic ------------ */
 async function postOrUpdateQueueView({ client, channel, teamId, title = 'Channel Queue', ts, queueNote, }) {
     const users = await listQueue(teamId, channel);
     const blocks = queueBlocks(title, users, { queueNote });
     const lastMessageKey = lastMessageKeyFor(teamId, channel);
-    const storedTs = await redis.get(lastMessageKey);
-    const targetTs = ts ?? storedTs ?? undefined;
-    if (targetTs) {
+    let cachedTs = await redis.get(lastMessageKey);
+    const effectiveTs = ts ?? cachedTs ?? undefined;
+    let forceNewMessage = false;
+    if (effectiveTs &&
+        QUEUE_REPOST_THRESHOLD !== null &&
+        QUEUE_REPOST_THRESHOLD >= 0) {
+        const needsRepost = await queueMessageNeedsRepost({
+            client,
+            channel,
+            ts: effectiveTs,
+            threshold: QUEUE_REPOST_THRESHOLD,
+        });
+        if (needsRepost) {
+            let deleted = false;
+            try {
+                await client.chat.delete({ channel, ts: effectiveTs });
+                deleted = true;
+            }
+            catch (err) {
+                const code = err?.data?.error;
+                if (code === 'message_not_found') {
+                    deleted = true;
+                }
+                else if (code !== 'cant_delete_message') {
+                    console.error('[queue] chat.delete failed:', code || err);
+                }
+            }
+            if (deleted) {
+                await redis.del(lastMessageKey);
+                cachedTs = null;
+                forceNewMessage = true;
+            }
+        }
+    }
+    if (!forceNewMessage && ts) {
         try {
-            const updateResult = await client.chat.update({
+            await client.chat.update({ channel, ts, blocks, text: 'Queue updated' });
+            await redis.set(lastMessageKey, ts);
+            return { ts };
+        }
+        catch (err) {
+            const code = err?.data?.error;
+            if (code !== 'message_not_found' && code !== 'cant_update_message')
+                console.error('[queue] chat.update failed:', code || err);
+        }
+    }
+    if (!forceNewMessage &&
+        cachedTs &&
+        (ts === undefined || cachedTs !== ts)) {
+        try {
+            await client.chat.update({
                 channel,
-                ts: targetTs,
+                ts: cachedTs,
                 blocks,
                 text: 'Queue updated',
             });
-            const updatedTs = updateResult?.ts ?? targetTs;
-            await redis.set(lastMessageKey, updatedTs);
-            return updateResult;
+            await redis.set(lastMessageKey, cachedTs);
+            return { ts: cachedTs };
         }
         catch (err) {
-            const slackError = err?.data?.error;
-            if (slackError !== 'message_not_found' && slackError !== 'cant_update_message') {
-                console.error('[queue] failed to update queue message:', err);
-            }
-            // fall through to post a fresh message
-            if (slackError === 'message_not_found' || slackError === 'cant_update_message') {
-                await redis.del(lastMessageKey);
-            }
+            const code = err?.data?.error;
+            if (code !== 'message_not_found' && code !== 'cant_update_message')
+                console.error('[queue] chat.update (cachedTs) failed:', code || err);
         }
     }
     const result = await client.chat.postMessage({
@@ -184,15 +239,14 @@ async function postOrUpdateQueueView({ client, channel, teamId, title = 'Channel
         blocks,
         text: 'Queue',
     });
-    if (result?.ts) {
-        await redis.set(lastMessageKey, result.ts);
-    }
-    else {
+    const newTs = result?.ts;
+    if (newTs)
+        await redis.set(lastMessageKey, newTs);
+    else
         await redis.del(lastMessageKey);
-    }
     return result;
 }
-/* ------------ Notify when first-in-line changes ------------ */
+/* ------------ Notifications ------------ */
 async function firstUser(teamId, channelId) {
     await pruneStaleQueueEntries(teamId, channelId);
     const key = keyFor(teamId, channelId);
@@ -200,12 +254,10 @@ async function firstUser(teamId, channelId) {
     return users[0] ?? null;
 }
 async function notifyNowFirst({ client, channelId, userId, alsoDM = process.env.NOTIFY_DM === 'true', }) {
-    // Channel mention
     await client.chat.postMessage({
         channel: channelId,
         text: `<@${userId}> you're now first in the deploy queue!`,
     });
-    // Optional DM
     if (alsoDM) {
         const im = await client.conversations.open({ users: userId });
         await client.chat.postMessage({
@@ -214,21 +266,17 @@ async function notifyNowFirst({ client, channelId, userId, alsoDM = process.env.
         });
     }
 }
-/** Wrap a mutating op; if #1 changed, notify the new #1.
- *  Set suppressWhenBeforeNull=true to skip notifying when the queue was empty.
- */
 async function withFirstChangeNotify(client, teamId, channelId, op, opts) {
     const before = await firstUser(teamId, channelId);
     await op();
     const after = await firstUser(teamId, channelId);
     if (after && after !== before) {
-        if (opts?.suppressWhenBeforeNull && !before) {
-            return; // queue was empty -> don't ping on first join
-        }
+        if (opts?.suppressWhenBeforeNull && !before)
+            return;
         await notifyNowFirst({ client, channelId, userId: after });
     }
 }
-/* ------------ Slash command: /deploy-queue ------------ */
+/* ------------ Slash command ------------ */
 app.command('/deploy-queue', async ({ ack, command, client, respond, body }) => {
     await ack();
     const teamId = body.team_id;
@@ -237,16 +285,6 @@ app.command('/deploy-queue', async ({ ack, command, client, respond, body }) => 
     const [sub] = (command.text || '').trim().split(/\s+/);
     const action = (sub || 'show').toLowerCase();
     switch (action) {
-        case 'clear': {
-            const deleted = await clearQueueMessage(teamId, channelId, client);
-            await respond({
-                response_type: 'ephemeral',
-                text: deleted
-                    ? 'Removed the current deploy queue message.'
-                    : 'No deploy queue message to remove.',
-            });
-            break;
-        }
         case 'join': {
             await withFirstChangeNotify(client, teamId, channelId, async () => {
                 const added = await joinQueue(teamId, channelId, userId);
@@ -256,8 +294,7 @@ app.command('/deploy-queue', async ({ ack, command, client, respond, body }) => 
                         ? 'You joined the queue.'
                         : 'You are already in the queue.',
                 });
-            }, { suppressWhenBeforeNull: true } // 👈 skip ping if queue was empty
-            );
+            }, { suppressWhenBeforeNull: true });
             await postOrUpdateQueueView({ client, channel: channelId, teamId });
             break;
         }
@@ -272,9 +309,8 @@ app.command('/deploy-queue', async ({ ack, command, client, respond, body }) => 
                         ? 'You left the queue.'
                         : 'You were not in the queue.',
                 });
-                if (removed) {
+                if (removed)
                     nextUserId = await firstUser(teamId, channelId);
-                }
             });
             const queueNote = removed
                 ? leaveQueueNote(userId, nextUserId)
@@ -288,7 +324,6 @@ app.command('/deploy-queue', async ({ ack, command, client, respond, body }) => 
             break;
         }
         case 'next': {
-            // Announce who is up now (the person popped)
             await withFirstChangeNotify(client, teamId, channelId, async () => {
                 const nextUser = await popNext(teamId, channelId);
                 await client.chat.postMessage({
@@ -299,15 +334,13 @@ app.command('/deploy-queue', async ({ ack, command, client, respond, body }) => 
             await postOrUpdateQueueView({ client, channel: channelId, teamId });
             break;
         }
-        case 'show':
         default: {
             await postOrUpdateQueueView({ client, channel: channelId, teamId });
-            break;
         }
     }
 });
 /* ------------ Button actions ------------ */
-async function handleAction(actionId, handler) {
+function handleAction(actionId, handler) {
     app.action(actionId, handler);
 }
 handleAction('queue_join', async ({ ack, body, client }) => {
@@ -317,14 +350,44 @@ handleAction('queue_join', async ({ ack, body, client }) => {
     const userId = body.user.id;
     await withFirstChangeNotify(client, teamId, channelId, async () => {
         await joinQueue(teamId, channelId, userId);
-    }, { suppressWhenBeforeNull: true } // 👈 skip ping if queue was empty
-    );
+    }, { suppressWhenBeforeNull: true });
     await postOrUpdateQueueView({
         client,
         channel: channelId,
         teamId,
         ts: body.message?.ts,
     });
+});
+app.action('queue_more', async ({ ack, action, body, client, respond }) => {
+    await ack();
+    const selected = action.selected_option?.value;
+    if (selected !== 'delete')
+        return;
+    const channelId = body.channel?.id;
+    const teamId = body.team?.id;
+    const ts = body.message?.ts;
+    if (!channelId || !ts)
+        return;
+    try {
+        await client.chat.delete({ channel: channelId, ts });
+        if (teamId)
+            await redis.del(lastMessageKeyFor(teamId, channelId));
+        if (respond) {
+            await respond({
+                response_type: 'ephemeral',
+                text: 'Queue message deleted.',
+            });
+        }
+    }
+    catch (err) {
+        console.error('[queue] chat.delete failed:', err);
+        if (respond) {
+            await respond({
+                response_type: 'ephemeral',
+                text: 'Sorry, I could not delete that message.',
+            });
+        }
+    }
 });
 handleAction('queue_leave', async ({ ack, body, client }) => {
     await ack();
@@ -335,13 +398,10 @@ handleAction('queue_leave', async ({ ack, body, client }) => {
     let nextUserId = null;
     await withFirstChangeNotify(client, teamId, channelId, async () => {
         removed = await leaveQueue(teamId, channelId, userId);
-        if (removed) {
+        if (removed)
             nextUserId = await firstUser(teamId, channelId);
-        }
     });
-    const queueNote = removed
-        ? leaveQueueNote(userId, nextUserId)
-        : undefined;
+    const queueNote = removed ? leaveQueueNote(userId, nextUserId) : undefined;
     await postOrUpdateQueueView({
         client,
         channel: channelId,
@@ -361,11 +421,8 @@ handleAction('queue_refresh', async ({ ack, body, client }) => {
         ts: body.message?.ts,
     });
 });
-/* ------------ Global error logger (handy) ------------ */
-app.error(async (err) => {
-    console.error('[bolt] app.error:', err);
-});
-/* ------------ Start ------------ */
+/* ------------ Error & startup ------------ */
+app.error(async (err) => console.error('[bolt] app.error:', err));
 (async () => {
     await app.start();
     if (NODE_ENV !== 'test')
