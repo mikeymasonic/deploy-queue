@@ -161,18 +161,24 @@ async function notifyNowFirst({
     });
   }
 }
-
-/** Wrap a mutating op; if #1 changed, notify the new #1 */
+/** Wrap a mutating op; if #1 changed, notify the new #1.
+ *  Set suppressWhenBeforeNull=true to skip notifying when the queue was empty.
+ */
 async function withFirstChangeNotify(
   client: any,
   teamId: string,
   channelId: string,
-  op: () => Promise<void>
+  op: () => Promise<void>,
+  opts?: { suppressWhenBeforeNull?: boolean }
 ) {
   const before = await firstUser(teamId, channelId);
   await op();
   const after = await firstUser(teamId, channelId);
+
   if (after && after !== before) {
+    if (opts?.suppressWhenBeforeNull && !before) {
+      return; // queue was empty -> don't ping on first join
+    }
     await notifyNowFirst({ client, channelId, userId: after });
   }
 }
@@ -191,18 +197,25 @@ app.command(
 
     switch (action) {
       case 'join': {
-        await withFirstChangeNotify(client, teamId, channelId, async () => {
-          const added = await joinQueue(teamId, channelId, userId);
-          await respond({
-            response_type: 'ephemeral',
-            text: added
-              ? 'You joined the queue.'
-              : 'You are already in the queue.',
-          });
-        });
+        await withFirstChangeNotify(
+          client,
+          teamId,
+          channelId,
+          async () => {
+            const added = await joinQueue(teamId, channelId, userId);
+            await respond({
+              response_type: 'ephemeral',
+              text: added
+                ? 'You joined the queue.'
+                : 'You are already in the queue.',
+            });
+          },
+          { suppressWhenBeforeNull: true } // 👈 skip ping if queue was empty
+        );
         await postOrUpdateQueueView({ client, channel: channelId, teamId });
         break;
       }
+
       case 'leave': {
         await withFirstChangeNotify(client, teamId, channelId, async () => {
           const removed = await leaveQueue(teamId, channelId, userId);
@@ -254,9 +267,15 @@ handleAction('queue_join', async ({ ack, body, client }) => {
   const channelId = body.channel!.id!;
   const userId = body.user.id;
 
-  await withFirstChangeNotify(client, teamId, channelId, async () => {
-    await joinQueue(teamId, channelId, userId);
-  });
+  await withFirstChangeNotify(
+    client,
+    teamId,
+    channelId,
+    async () => {
+      await joinQueue(teamId, channelId, userId);
+    },
+    { suppressWhenBeforeNull: true } // 👈 skip ping if queue was empty
+  );
 
   await postOrUpdateQueueView({
     client,
