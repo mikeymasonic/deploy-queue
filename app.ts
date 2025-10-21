@@ -54,6 +54,8 @@ const app = new App({
 /* ------------ Helpers: storage & formatting ------------ */
 const keyFor = (teamId: string, channelId: string) =>
   `queue:${teamId}:${channelId}`;
+const lastMessageKeyFor = (teamId: string, channelId: string) =>
+  `queue:last-message:${teamId}:${channelId}`;
 
 async function pruneStaleQueueEntries(teamId: string, channelId: string) {
   if (!QUEUE_MAX_AGE_MS) return;
@@ -181,10 +183,33 @@ async function postOrUpdateQueueView({
 }) {
   const users = await listQueue(teamId, channel);
   const blocks = queueBlocks(title, users, { queueNote });
-  if (ts) {
-    return client.chat.update({ channel, ts, blocks, text: 'Queue updated' });
+  const lastMessageKey = lastMessageKeyFor(teamId, channel);
+  const knownTs = ts ?? (await redis.get(lastMessageKey));
+
+  if (knownTs) {
+    try {
+      await client.chat.delete({ channel, ts: knownTs });
+    } catch (err: any) {
+      const slackError = err?.data?.error;
+      if (slackError !== 'message_not_found' && slackError !== 'cant_delete_message') {
+        console.error('[queue] failed to delete previous queue message:', err);
+      }
+    }
   }
-  return client.chat.postMessage({ channel, blocks, text: 'Queue' });
+
+  const result = await client.chat.postMessage({
+    channel,
+    blocks,
+    text: 'Queue',
+  });
+
+  if (result?.ts) {
+    await redis.set(lastMessageKey, result.ts);
+  } else {
+    await redis.del(lastMessageKey);
+  }
+
+  return result;
 }
 
 /* ------------ Notify when first-in-line changes ------------ */
