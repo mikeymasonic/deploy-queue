@@ -375,9 +375,15 @@ handleAction('queue_join', async ({ ack, body, client }) => {
   const channelId = body.channel!.id!;
   const userId = body.user.id;
 
-  await withFirstChangeNotify(client, teamId, channelId, async () => {
-    await joinQueue(teamId, channelId, userId);
-  });
+  await withFirstChangeNotify(
+    client,
+    teamId,
+    channelId,
+    async () => {
+      await joinQueue(teamId, channelId, userId);
+    },
+    { suppressWhenBeforeNull: true }
+  );
 
   await postOrUpdateQueueView({
     client,
