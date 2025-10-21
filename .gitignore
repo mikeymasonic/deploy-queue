@@ -1,0 +1,6 @@
+.env
+node_modules
+
+# Build directories
+build
+public
